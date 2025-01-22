@@ -1,46 +1,78 @@
 import numpy as np
 import pandas as pd
 import requests
-from models.algo_model import AlgoModel
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
 from models.hft_model import HFTModel
-from backtesting.backtest import Backtest
 import time
 import os
 from datetime import datetime, timedelta
 
 class TradingBot:
     def __init__(self, api_key, account_id, news_api_key):
-        self.algo_model = AlgoModel()
         self.hft_model = HFTModel(api_key, account_id)
         self.trade_log = []
         self.news_api_key = news_api_key
         self.position_open = False
         self.highest_price = 0
+        self.model = RandomForestClassifier(n_estimators=100, random_state=42)
+        self.historical_data = pd.DataFrame()
 
-    def train_models(self, historical_data, tick_data):
-        self.algo_model.train(historical_data)
+    def train_model(self, data):
+        # Prepare features and labels
+        features = data.select_dtypes(include=[np.number]).drop(columns=['Close'])
+        labels = np.where(data['Close'].shift(-1) > data['Close'], 1, 0)
 
-    def generate_signals(self, data):
-        # Moving Average Crossover Strategy
-        short_window = 40
-        long_window = 100
+        # Split data into training and testing sets
+        X_train, X_test, y_train, y_test = train_test_split(features, labels, test_size=0.2, random_state=42)
 
-        signals = pd.DataFrame(index=data.index)
-        signals['signal'] = 0.0
+        # Train the model
+        self.model.fit(X_train, y_train)
 
-        # Create short simple moving average
-        signals['short_mavg'] = data['Close'].rolling(window=short_window, min_periods=1, center=False).mean()
+        # Evaluate the model
+        predictions = self.model.predict(X_test)
+        accuracy = accuracy_score(y_test, predictions)
+        print(f"Model accuracy: {accuracy}")
 
-        # Create long simple moving average
-        signals['long_mavg'] = data['Close'].rolling(window=long_window, min_periods=1, center=False).mean()
+    def generate_features(self, data):
+        # Technical indicators
+        data['SMA_20'] = data['Close'].rolling(window=20).mean()
+        data['SMA_50'] = data['Close'].rolling(window=50).mean()
+        data['EMA_20'] = data['Close'].ewm(span=20, adjust=False).mean()
+        data['EMA_50'] = data['Close'].ewm(span=50, adjust=False).mean()
+        data['RSI'] = self.calculate_rsi(data['Close'])
+        data['MACD'], data['MACD_Signal'] = self.calculate_macd(data['Close'])
 
-        # Create signals
-        signals.loc[short_window:, 'signal'] = np.where(signals.loc[short_window:, 'short_mavg'] > signals.loc[short_window:, 'long_mavg'], 1.0, 0.0)
+        # Sentiment analysis
+        sentiment_score = self.fetch_and_analyze_news()
+        data['Sentiment'] = sentiment_score
 
-        # Generate trading orders
-        signals['positions'] = signals['signal'].diff()
+        # Fill missing values
+        data.ffill(inplace=True)
+        data.bfill(inplace=True)
 
-        return signals['positions'].iloc[-1]
+        return data
+
+    def calculate_rsi(self, series, period=14):
+        delta = series.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+
+    def calculate_macd(self, series, short_period=12, long_period=26, signal_period=9):
+        short_ema = series.ewm(span=short_period, adjust=False).mean()
+        long_ema = series.ewm(span=long_period, adjust=False).mean()
+        macd = short_ema - long_ema
+        macd_signal = macd.ewm(span=signal_period, adjust=False).mean()
+        return macd, macd_signal
+
+    def fetch_and_analyze_news(self):
+        news_data = self.fetch_market_news()
+        sentiment_score = self.analyze_news(news_data)
+        return sentiment_score
 
     def execute_trades(self, signal, symbol):
         if signal == 1 and not self.position_open:
@@ -61,6 +93,10 @@ class TradingBot:
         }
         self.trade_log.append(trade)
         print(f"Logged trade: {trade}")
+
+        # Log trade to CSV file
+        trade_df = pd.DataFrame([trade])
+        trade_df.to_csv('trade_log.csv', mode='a', header=not os.path.exists('trade_log.csv'), index=False)
 
     def generate_report(self):
         df = pd.DataFrame(self.trade_log)
@@ -99,38 +135,69 @@ class TradingBot:
             print("No articles found in news data.")
         return sentiment_score
 
+    def fetch_additional_historical_data(self, symbol, granularity, count):
+        url = f"https://api-fxpractice.oanda.com/v3/instruments/{symbol}/candles"
+        params = {
+            "granularity": granularity,
+            "count": count
+        }
+        headers = {
+            "Authorization": f"Bearer {self.hft_model.api_key}"
+        }
+        response = requests.get(url, headers=headers, params=params)
+        if response.status_code == 200:
+            data = response.json()
+            candles = data['candles']
+            historical_data = pd.DataFrame([{
+                'Date': candle['time'],
+                'Open': float(candle['mid']['o']),
+                'High': float(candle['mid']['h']),
+                'Low': float(candle['mid']['l']),
+                'Close': float(candle['mid']['c']),
+                'Volume': candle['volume']
+            } for candle in candles])
+            return historical_data
+        else:
+            print(f"Failed to fetch historical data: {response.status_code}")
+            return pd.DataFrame()
+
     def run(self):
         symbol = 'EUR_USD'
         take_profit_threshold = 0.001  # Example threshold for taking profit
+        min_data_points = 50  # Minimum data points required for feature generation
+
+        # Fetch additional historical data if needed
+        if len(self.historical_data) < min_data_points:
+            additional_data = self.fetch_additional_historical_data(symbol, 'M1', min_data_points - len(self.historical_data))
+            self.historical_data = pd.concat([self.historical_data, additional_data]).reset_index(drop=True)
+
         while True:
             try:
                 # Fetch real-time price data
-                self.current_price = self.hft_model.get_realtime_data(symbol)
+                self.current_price = float(self.hft_model.get_realtime_data(symbol))
                 if self.current_price is None:
                     print("No price data available. Skipping this iteration.")
                     time.sleep(60)
                     continue
                 print(f"Fetched real-time price for {symbol}: {self.current_price}")
                 
-                # Prepare the data for signal generation
-                data = pd.DataFrame([[self.current_price]], columns=['Close'])
+                # Append the current price to historical data
+                new_data = pd.DataFrame([[self.current_price]], columns=['Close'])
+                self.historical_data = pd.concat([self.historical_data, new_data]).reset_index(drop=True)
+                
+                # Ensure we have enough data points
+                if len(self.historical_data) < min_data_points:
+                    print("Not enough data points. Skipping this iteration.")
+                    time.sleep(60)
+                    continue
+                
+                # Generate features
+                data = self.generate_features(self.historical_data)
                 
                 # Generate trading signal
-                signal = self.generate_signals(data)
+                signal = self.model.predict(data.select_dtypes(include=[np.number]).drop(columns=['Close']).iloc[-1:])[0]
                 print(f"Generated trading signal: {signal}")
                 
-                # Fetch market news
-                news_data = self.fetch_market_news()
-                if news_data:
-                    sentiment_score = self.analyze_news(news_data)
-                    print(f"Market sentiment score: {sentiment_score}")
-                    
-                    # Adjust signal based on sentiment score
-                    if sentiment_score > 0:
-                        signal = 1  # Buy
-                    elif sentiment_score < 0:
-                        signal = -1  # Sell
-
                 # Check for take-profit condition
                 if self.position_open and self.current_price < self.highest_price - take_profit_threshold:
                     signal = -1  # Sell to take profit
@@ -168,12 +235,17 @@ if __name__ == "__main__":
     # Load historical data
     if os.path.exists(historical_data_path):
         historical_data = pd.read_csv(historical_data_path)
+        historical_data['Open'] = historical_data['Open'].astype(float)
+        historical_data['High'] = historical_data['High'].astype(float)
+        historical_data['Low'] = historical_data['Low'].astype(float)
+        historical_data['Close'] = historical_data['Close'].astype(float)
     else:
         print(f"Warning: historical_data.csv not found at {historical_data_path}. Fetching data from OANDA.")
         historical_data = pd.DataFrame(columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume'])  # Empty placeholder
     
-    # Train the models
-    bot.train_models(historical_data, tick_data)
+    # Generate features and train the model
+    historical_data = bot.generate_features(historical_data)
+    bot.train_model(historical_data)
     
     # Run the trading bot
     try:
